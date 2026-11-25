@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -132,3 +133,83 @@ async def test_concurrent_proxy_calls_do_not_misroute_elicitation():
     assert r1.data == "caller-1"
     assert r2.data == "second-done"
     assert seen == {"first": ["Name?"], "second": []}
+
+
+CONCURRENT_STDIO_BACKEND_SCRIPT = """
+from fastmcp import Context, FastMCP
+from fastmcp.server.elicitation import AcceptedElicitation
+
+server = FastMCP("concurrent-stdio-backend")
+
+@server.tool
+async def greet_and_log(caller: str, ctx: Context) -> str:
+    await ctx.log(f"start {caller}", level="info")
+    result = await ctx.elicit(f"Name for {caller}?", response_type=str)
+    assert isinstance(result, AcceptedElicitation)
+    await ctx.log(f"end {caller}", level="info")
+    return f"{caller}:{result.data}"
+
+server.run(show_banner=False)
+"""
+
+
+@pytest.mark.subprocess_heavy
+async def test_concurrent_keepalive_stdio_backend_isolates_callbacks(tmp_path: Path):
+    script = tmp_path / "concurrent_stdio_backend.py"
+    script.write_text(CONCURRENT_STDIO_BACKEND_SCRIPT, encoding="utf-8")
+
+    backend_transport = StdioTransport(sys.executable, [str(script)])
+    try:
+        proxy = create_proxy(backend_transport)
+        logs_1: list[Any] = []
+        logs_2: list[Any] = []
+        prompts_1: list[str] = []
+        prompts_2: list[str] = []
+
+        async def on_log_1(message: LogMessage) -> None:
+            logs_1.append(message.data)
+
+        async def on_log_2(message: LogMessage) -> None:
+            logs_2.append(message.data)
+
+        async def elicit_1(message, response_type, params, ctx):
+            prompts_1.append(message)
+            return ElicitResult(action="accept", content={"value": "Alice"})
+
+        async def elicit_2(message, response_type, params, ctx):
+            prompts_2.append(message)
+            return ElicitResult(action="accept", content={"value": "Bob"})
+
+        async with (
+            Client(
+                proxy,
+                mode="legacy",
+                log_handler=on_log_1,
+                elicitation_handler=elicit_1,
+            ) as client_1,
+            Client(
+                proxy,
+                mode="legacy",
+                log_handler=on_log_2,
+                elicitation_handler=elicit_2,
+            ) as client_2,
+        ):
+            r1, r2 = await asyncio.gather(
+                client_1.call_tool("greet_and_log", {"caller": "one"}),
+                client_2.call_tool("greet_and_log", {"caller": "two"}),
+            )
+
+        assert r1.data == "one:Alice"
+        assert r2.data == "two:Bob"
+        assert prompts_1 == ["Name for one?"]
+        assert prompts_2 == ["Name for two?"]
+        assert logs_1 == [
+            {"msg": "start one", "extra": None},
+            {"msg": "end one", "extra": None},
+        ]
+        assert logs_2 == [
+            {"msg": "start two", "extra": None},
+            {"msg": "end two", "extra": None},
+        ]
+    finally:
+        await backend_transport.close()

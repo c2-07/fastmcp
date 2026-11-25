@@ -7,12 +7,14 @@ classes that forward execution to remote servers.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import json
 import time
 import warnings
 import weakref
+from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -1945,37 +1947,69 @@ class _ForwardingEntry:
 
 
 class _SessionForwardingTarget:
-    """Tracks active ProxyClient calls sharing a single ClientSession.
+    """Serializes distinct ProxyClient calls sharing a single ClientSession.
 
     A keep-alive transport (such as ``StdioTransport(keep_alive=True)``) reuses
     the ``ClientSession`` created by the first ``ProxyClient`` copy across
-    later ``new()`` copies. Keying forwarding state by ``ClientSession`` ensures
-    reused sessions route callbacks to the active copy without sharing mutable
-    state across distinct backend sessions.
+    later ``new()`` copies. Serializing distinct copies on that session ensures
+    concurrent frontend requests cannot interleave or misroute session-wide
+    callbacks (logs, elicitation, sampling, roots) while still allowing
+    reentrant entry on the same copy and full parallelism across separate
+    backend sessions.
     """
 
     def __init__(self) -> None:
-        self._entries: list[_ForwardingEntry] = []
+        self._owner_token: object | None = None
+        self._owner_depth: int = 0
+        self._active_entry: _ForwardingEntry | None = None
+        self._waiters: deque[tuple[asyncio.Future[None], _ForwardingEntry]] = deque()
 
-    def register(
-        self,
-        token: object,
-        rc_ref: list[Any],
-        pending_logs: set[anyio.Event],
-    ) -> None:
-        self.unregister(token)
-        self._entries.append(
-            _ForwardingEntry(token=token, rc_ref=rc_ref, pending_logs=pending_logs)
-        )
+    async def acquire(self, entry: _ForwardingEntry) -> None:
+        """Acquire exclusive forwarding ownership for ``entry`` on this session."""
+        if self._owner_token is None or self._owner_token is entry.token:
+            self._owner_token = entry.token
+            self._owner_depth += 1
+            self._active_entry = entry
+            return
 
-    def unregister(self, token: object) -> None:
-        self._entries = [e for e in self._entries if e.token is not token]
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append((waiter, entry))
+        try:
+            await waiter
+        except BaseException:
+            if not waiter.done():
+                self._waiters = deque(
+                    item for item in self._waiters if item[0] is not waiter
+                )
+            elif self._owner_token is entry.token:
+                self.release(entry.token)
+            raise
+
+    def release(self, token: object) -> None:
+        """Release one forwarding hold owned by ``token`` and hand off FIFO."""
+        if self._owner_token is not token:
+            return
+        self._owner_depth -= 1
+        if self._owner_depth > 0:
+            return
+        while self._waiters:
+            waiter, next_entry = self._waiters.popleft()
+            if not waiter.done():
+                self._owner_token = next_entry.token
+                self._owner_depth = 1
+                self._active_entry = next_entry
+                waiter.set_result(None)
+                return
+        self._owner_token = None
+        self._active_entry = None
+
+    def release_all(self, token: object) -> None:
+        """Release all reentrant holds owned by ``token`` (for forced teardown)."""
+        while self._owner_token is token and self._owner_depth > 0:
+            self.release(token)
 
     def active(self) -> _ForwardingEntry | None:
-        for entry in reversed(self._entries):
-            if entry.rc_ref[0] is not None:
-                return entry
-        return self._entries[-1] if self._entries else None
+        return self._active_entry
 
 
 _SESSION_FORWARDING_TARGETS: weakref.WeakKeyDictionary[
@@ -1983,17 +2017,11 @@ _SESSION_FORWARDING_TARGETS: weakref.WeakKeyDictionary[
 ] = weakref.WeakKeyDictionary()
 
 
-def _register_session_forwarding(
-    session: ClientSession,
-    token: object,
-    rc_ref: list[Any],
-    pending_logs: set[anyio.Event],
-) -> _SessionForwardingTarget:
+def _get_session_forwarding_target(session: ClientSession) -> _SessionForwardingTarget:
     target = _SESSION_FORWARDING_TARGETS.get(session)
     if target is None:
         target = _SessionForwardingTarget()
         _SESSION_FORWARDING_TARGETS[session] = target
-    target.register(token, rc_ref, pending_logs)
     return target
 
 
@@ -2125,7 +2153,7 @@ class ProxyClient(Client[ClientTransportT]):
                     default_fn,
                     self._proxy_rc_ref,
                     self._pending_proxy_logs if key == "log_handler" else None,
-                    self._session_target_ref,
+                    None if key == "progress_handler" else self._session_target_ref,
                 )
                 self._proxy_restoring_handler_keys.add(key)
         super().__init__(transport=transport, **kwargs)  # ty: ignore[no-matching-overload]
@@ -2135,26 +2163,32 @@ class ProxyClient(Client[ClientTransportT]):
             forward_incoming_headers=forward_incoming_headers,
         )
 
+    async def __aenter__(self):
+        await super().__aenter__()
+        target = _get_session_forwarding_target(self.session)
+        # Keep pointing to this session's target across exits so callbacks
+        # bound to an earlier ProxyClient copy resolve the active caller on a
+        # kept-alive session reused by later copies.
+        self._session_target_ref[0] = target
+        entry = _ForwardingEntry(
+            token=self._forwarding_token,
+            rc_ref=self._proxy_rc_ref,
+            pending_logs=self._pending_proxy_logs,
+        )
+        try:
+            await target.acquire(entry)
+        except BaseException:
+            await super().__aexit__(None, None, None)
+            raise
+        return self
+
     @asynccontextmanager
     async def _context_manager(self):
         # Each backend session declares the relays of the front request that
         # opens it, including on a client shared between front connections.
         self._mirror_front_capabilities()
         async with super()._context_manager():
-            target = _register_session_forwarding(
-                self.session,
-                self._forwarding_token,
-                self._proxy_rc_ref,
-                self._pending_proxy_logs,
-            )
-            # Keep pointing to this session's target after exit so callbacks
-            # created with this copy still resolve active calls on a kept-alive
-            # session reused by later ProxyClient copies.
-            self._session_target_ref[0] = target
-            try:
-                yield
-            finally:
-                target.unregister(self._forwarding_token)
+            yield
 
     def _mirror_front_capabilities(self) -> None:
         """Declare to the backend only the relayed features the front client declared.
@@ -2221,7 +2255,6 @@ class ProxyClient(Client[ClientTransportT]):
             self._progress_handler = _make_restoring_handler(
                 default_proxy_progress_handler,
                 self._proxy_rc_ref,
-                session_target_ref=self._session_target_ref,
             )
         if "message_handler" in self._proxy_restoring_handler_keys:
             message_handler = _make_restoring_handler(
@@ -2236,16 +2269,33 @@ class ProxyClient(Client[ClientTransportT]):
                 else message_handler
             )
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def _drain_pending_proxy_logs(self) -> None:
         # The SDK runs notification callbacks concurrently with the response,
-        # so a backend's logs can still be forwarding when its result arrives.
-        # Let them finish before disconnecting cancels them.
+        # so a backend's logs can still be pending scheduling or forwarding when
+        # its result arrives. Yield once so queued callbacks enter and record
+        # their events, then let them finish before releasing ownership or
+        # disconnecting.
+        await asyncio.sleep(0)
+        if self._pending_proxy_logs:
+            with anyio.move_on_after(self._disconnect_timeout):
+                while self._pending_proxy_logs:
+                    await next(iter(self._pending_proxy_logs)).wait()
+
+    def _release_session_forwarding(self, *, release_all: bool = False) -> None:
+        target = self._session_target_ref[0]
+        if target is None:
+            return
+        if release_all:
+            target.release_all(self._forwarding_token)
+        else:
+            target.release(self._forwarding_token)
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         try:
-            if exc_type is None and self._pending_proxy_logs:
-                with anyio.move_on_after(self._disconnect_timeout):
-                    while self._pending_proxy_logs:
-                        await next(iter(self._pending_proxy_logs)).wait()
+            if exc_type is None:
+                await self._drain_pending_proxy_logs()
         finally:
+            self._release_session_forwarding()
             await super().__aexit__(exc_type, exc_val, exc_tb)
 
     def new(self) -> ProxyClient[ClientTransportT]:
@@ -2287,16 +2337,23 @@ class StatefulProxyClient(ProxyClient[ClientTransportT]):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore[override]
         """Release this context without disconnecting the persistent session."""
-        with anyio.CancelScope(shield=True):
-            async with self._session_state.lock:
-                self._session_state.nesting_counter = max(
-                    0, self._session_state.nesting_counter - 1
-                )
+        try:
+            if exc_type is None:
+                await self._drain_pending_proxy_logs()
+        finally:
+            with anyio.CancelScope(shield=True):
+                self._release_session_forwarding()
+                async with self._session_state.lock:
+                    self._session_state.nesting_counter = max(
+                        0, self._session_state.nesting_counter - 1
+                    )
 
     async def clear(self):
         """Clear all cached clients and force disconnect them."""
         while self._caches:
             _, cache = self._caches.popitem()
+            if isinstance(cache, ProxyClient):
+                cache._release_session_forwarding(release_all=True)
             await cache._disconnect(force=True)
 
     def new_stateful(self) -> Client[ClientTransportT]:
@@ -2331,6 +2388,8 @@ class StatefulProxyClient(ProxyClient[ClientTransportT]):
                 # actually runs to completion instead of aborting at the first
                 # cancellation checkpoint (e.g. acquiring the session lock).
                 with anyio.CancelScope(shield=True):
+                    if isinstance(proxy_client, ProxyClient):
+                        proxy_client._release_session_forwarding(release_all=True)
                     await proxy_client._disconnect(force=True)
 
             connection.exit_stack.push_async_callback(_on_connection_exit)
