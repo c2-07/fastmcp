@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import math
@@ -32,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic.json_schema import SkipJsonSchema
+from pydantic_core import core_schema
 
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.authorization import AuthCheck
@@ -78,6 +80,94 @@ def default_serializer(data: Any) -> str:
     return _JSONABLE_ADAPTER.dump_json(data, fallback=str).decode()
 
 
+def _serialize_any_nested(value: Any, _seen: set[int] | None = None) -> Any:
+    """Resolve dynamic BaseModel/dataclass values in `Any` schemas cleanly."""
+    cls = type(value)
+    if isinstance(value, BaseModel) or (
+        dataclasses.is_dataclass(value) and not isinstance(value, type)
+    ):
+        try:
+            return json.loads(_get_json_serializer(cls).to_json(value))
+        except PydanticSchemaGenerationError:
+            return value
+
+    if isinstance(value, dict):
+        obj_id = id(value)
+        seen = _seen if _seen is not None else set()
+        if obj_id in seen:
+            return value
+        seen.add(obj_id)
+        try:
+            changed = False
+            out: dict[Any, Any] = {}
+            for key, item in value.items():
+                new_item = _serialize_any_nested(item, seen)
+                if new_item is not item:
+                    changed = True
+                out[key] = new_item
+            return out if changed else value
+        finally:
+            seen.discard(obj_id)
+
+    if isinstance(value, list | tuple | set | frozenset):
+        obj_id = id(value)
+        seen = _seen if _seen is not None else set()
+        if obj_id in seen:
+            return value
+        seen.add(obj_id)
+        try:
+            changed = False
+            items: list[Any] = []
+            for item in value:
+                new_item = _serialize_any_nested(item, seen)
+                if new_item is not item:
+                    changed = True
+                items.append(new_item)
+            if not changed:
+                return value
+            return tuple(items) if isinstance(value, tuple) else items
+        finally:
+            seen.discard(obj_id)
+
+    return value
+
+
+def _serialize_any_for_json(
+    value: Any,
+    handler: core_schema.SerializerFunctionWrapHandler,
+) -> Any:
+    return handler(_serialize_any_nested(value))
+
+
+def _rewrite_schema_for_constants(schema: Any) -> Any:
+    """Default model/dataclass nodes to `ser_json_inf_nan="constants"` when unset.
+
+    Models without an explicit `ser_json_inf_nan` config would otherwise use
+    Pydantic's default (`"null"`), silently turning NaN/Infinity into null.
+    Explicit per-model configs (`"null"`, `"strings"`, `"constants"`) already
+    carry the key and keep control of their own output.
+    """
+    if isinstance(schema, dict):
+        rewritten = {k: _rewrite_schema_for_constants(v) for k, v in schema.items()}
+        schema_type = rewritten.get("type")
+        if schema_type in ("model", "dataclass"):
+            cfg = dict(rewritten.get("config") or {})
+            cfg.setdefault("ser_json_inf_nan", "constants")
+            rewritten["config"] = cfg
+        elif schema_type == "any" and "serialization" not in rewritten:
+            rewritten["serialization"] = (
+                core_schema.wrap_serializer_function_ser_schema(
+                    _serialize_any_for_json,
+                    info_arg=False,
+                    when_used="json",
+                )
+            )
+        return rewritten
+    if isinstance(schema, list):
+        return [_rewrite_schema_for_constants(item) for item in schema]
+    return schema
+
+
 @lru_cache(maxsize=5000)
 def _get_json_serializer(annotation: Any) -> pydantic_core.SchemaSerializer:
     """Build a serializer that follows the real JSON serialization contract.
@@ -85,12 +175,18 @@ def _get_json_serializer(annotation: Any) -> pydantic_core.SchemaSerializer:
     `ser_json_inf_nan="constants"` keeps non-finite floats as NaN/Infinity JSON
     tokens instead of silently rewriting them to null, so the tokens that reach
     the wire can be rejected at the JSON boundary (see `_reject_nonfinite`).
-    The schema is the annotation's own, so custom serializers and explicit
-    per-model policies keep control of their output.
+    Rewriting model/dataclass nodes without an explicit `ser_json_inf_nan`
+    policy and compiling with `_use_prebuilt=False` extends that boundary to
+    plain Pydantic models while explicit per-model policies and custom
+    serializers keep control of their output.
     """
+    schema = _rewrite_schema_for_constants(
+        get_cached_typeadapter(annotation).core_schema
+    )
     return pydantic_core.SchemaSerializer(
-        get_cached_typeadapter(annotation).core_schema,
+        schema,
         config={"ser_json_inf_nan": "constants"},
+        _use_prebuilt=False,
     )
 
 

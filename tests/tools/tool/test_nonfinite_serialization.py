@@ -10,8 +10,9 @@ per-model policies keep control of their own output.
 import math
 from typing import Any
 
+import pydantic
 import pytest
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
@@ -85,6 +86,82 @@ class TestNonFiniteStructuredContentRejected:
             with pytest.raises(ToolError, match=r"non-finite.*\$\.rows\[1\]\.v"):
                 await client.call_tool("nested", {})
 
+    async def test_nan_in_plain_base_model_raises(self):
+        class Stats(BaseModel):
+            mean: float
+            count: int = 1
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def stats() -> Stats:
+            return Stats(mean=float("nan"))
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match=r"nan.*\$\.mean"):
+                await client.call_tool("stats", {})
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+    async def test_inf_in_plain_base_model_raises(self, bad: float):
+        class Stats(BaseModel):
+            mean: float
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def stats() -> Stats:
+            return Stats(mean=bad)
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match=r"non-finite.*\$\.mean"):
+                await client.call_tool("stats", {})
+
+    async def test_nan_in_untyped_base_model_return_raises(self):
+        class Stats(BaseModel):
+            mean: float
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def stats():
+            return Stats(mean=float("nan"))
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match=r"nan.*\$\.mean"):
+                await client.call_tool("stats", {})
+
+    async def test_nan_in_nested_base_model_list_raises_with_path(self):
+        class Stats(BaseModel):
+            mean: float
+
+        class Outer(BaseModel):
+            rows: list[Stats]
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def report() -> Outer:
+            return Outer(rows=[Stats(mean=1.0), Stats(mean=float("inf"))])
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match=r"non-finite.*\$\.rows\[1\]\.mean"):
+                await client.call_tool("report", {})
+
+    async def test_nan_in_pydantic_dataclass_raises(self):
+        @pydantic.dataclasses.dataclass
+        class StatsDC:
+            mean: float
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def stats() -> StatsDC:
+            return StatsDC(mean=float("nan"))
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match=r"nan.*\$\.mean"):
+                await client.call_tool("stats", {})
+
 
 class TestFiniteValuesUnaffected:
     async def test_finite_structured_content_round_trips(self):
@@ -153,6 +230,54 @@ class TestSerializeToJsonableUnit:
             "mean": None
         }
 
+    def test_explicit_model_strings_policy_is_preserved(self):
+        class StringPol(BaseModel):
+            model_config = ConfigDict(ser_json_inf_nan="strings")
+            mean: float
+
+        assert _serialize_to_jsonable(StringPol(mean=float("nan")), StringPol) == {
+            "mean": "NaN"
+        }
+
+    def test_nested_explicit_null_policy_inside_plain_outer_model(self):
+        class Lenient(BaseModel):
+            model_config = ConfigDict(ser_json_inf_nan="null")
+            mean: float
+
+        class Outer(BaseModel):
+            ok: float
+            lenient: Lenient
+
+        assert _serialize_to_jsonable(
+            Outer(ok=1.0, lenient=Lenient(mean=float("nan"))), Outer
+        ) == {"ok": 1.0, "lenient": {"mean": None}}
+
+        with pytest.raises(ToolError, match=r"nan.*\$\.ok"):
+            _serialize_to_jsonable(
+                Outer(ok=float("nan"), lenient=Lenient(mean=float("nan"))), Outer
+            )
+
+    def test_excluded_nonfinite_field_on_plain_base_model_is_ignored(self):
+        class SecretNan(BaseModel):
+            ok: float
+            hidden: float = Field(default=float("nan"), exclude=True)
+
+        assert _serialize_to_jsonable(SecretNan(ok=1.5), SecretNan) == {"ok": 1.5}
+        assert _serialize_to_jsonable(SecretNan(ok=1.5)) == {"ok": 1.5}
+
+    def test_any_container_with_plain_and_recursive_models_rejects_nonfinite(self):
+        class Node(BaseModel):
+            val: float
+            children: list["Node"] = []
+
+        Node.model_rebuild()
+
+        with pytest.raises(ToolError, match=r"non-finite.*\$\.children\[0\]\.val"):
+            _serialize_to_jsonable(Node(val=1.0, children=[Node(val=math.inf)]), Node)
+
+        with pytest.raises(ToolError, match=r"nan.*\$\.node\.val"):
+            _serialize_to_jsonable({"node": Node(val=float("nan"))}, dict[str, Any])
+
     def test_tool_result_structured_content_rejects_non_finite(self):
         with pytest.raises(ToolError, match="non-finite"):
             ToolResult(structured_content={"v": float("nan")})
@@ -164,36 +289,6 @@ class TestDocumentedResidualBehavior:
     These tests pin the *current* behavior so any future policy change is a
     conscious, reviewed decision rather than a silent drift.
     """
-
-    async def test_default_base_model_policy_still_nulls_silently(self):
-        """A plain BaseModel's embedded config wins over the outer constants policy.
-
-        pydantic's per-model default (`ser_json_inf_nan="null"`) rewrites the
-        non-finite float to valid-JSON ``null``, so the substring guard never
-        fires and the caller gets ``{"mean": null}`` — not a ToolError. This is
-        the documented judgment call: overriding a model's embedded config from
-        outside is at odds with preserving model control.
-        """
-
-        class Stats(BaseModel):
-            mean: float
-
-        mcp = FastMCP()
-
-        @mcp.tool
-        def stats() -> Stats:
-            return Stats(mean=float("nan"))
-
-        async with Client(mcp) as client:
-            # Not rejected at the serialization boundary — the model's own
-            # default policy governed — so the null reaches the client and
-            # fails *its* output-schema validation with an error that never
-            # mentions nan.
-            with pytest.raises(RuntimeError, match="None is not of type 'number'"):
-                await client.call_tool("stats", {})
-
-        # Pin the boundary behavior: no ToolError, just the model's null.
-        assert _serialize_to_jsonable(Stats(mean=float("nan")), Stats) == {"mean": None}
 
     def test_default_serializer_rewrites_non_finite_to_null(self):
         """`default_serializer` (the text-content path) still nulls non-finites.
